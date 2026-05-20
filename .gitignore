@@ -30,6 +30,7 @@ backups/*
 !backups/.gitkeep 
 *.pyc
 __pycache__/
+playwright_cookies.json
 .pytest_cache/
 .mypy_cache/
 .coverage
