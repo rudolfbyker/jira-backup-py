@@ -101,7 +101,7 @@ class Atlassian:
                 filename += ".zip"
             return filename
         else:
-            return "{timestamp}_{uuid}.zip".format(timestamp=timestamp, uuid=uuid)
+            return f"{timestamp}_{uuid}_{backup_type}.zip"
 
     def create_confluence_backup(self) -> str:
         backup = self.session.post(
