@@ -8,12 +8,17 @@ import sys
 import time
 from importlib import import_module
 from pathlib import Path
-from typing import Dict, Any, Literal
+from typing import Dict, Any, Literal, Optional
 
 import requests
 import urllib3
 
 from ._config import read_config, Config
+
+
+_JIRA_EXPORT_LINK_SELECTOR = 'a[href*="/plugins/servlet/export/"]'
+_JIRA_EXPORT_TIMEOUT_MS = 600_000
+_QUICK_TIMEOUT_MS = 3_000
 
 
 class OptionalExtraMissingError(RuntimeError):
@@ -41,6 +46,32 @@ def ensure_upload_extras(config: Config) -> None:
         import_optional_extra(
             "azure.storage.blob", "azure", "Azure Blob Storage uploads"
         )
+
+
+def extract_backup_rate_limit_message(page_text: str) -> Optional[str]:
+    rate_limit_keywords = [
+        "sorry",
+        "backup frequency is limited",
+        "you can not make another backup",
+        "you cannot make another backup",
+        "approximate time till next allowed backup",
+        "approximate time until next allowed backup",
+    ]
+    page_text_lower = page_text.lower()
+
+    if not any(keyword in page_text_lower for keyword in rate_limit_keywords[1:]):
+        return None
+
+    message_lines = []
+    for line in page_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        line_lower = stripped.lower()
+        if any(keyword in line_lower for keyword in rate_limit_keywords):
+            message_lines.append(stripped)
+
+    return "\n".join(message_lines) if message_lines else "Backup frequency is limited."
 
 
 class Atlassian:
@@ -132,43 +163,256 @@ class Atlassian:
         )
 
     def create_jira_backup(self) -> str:
-        backup = self.session.post(
-            self.start_jira_backup, data=json.dumps(self.payload)
-        )
-        task_id = ""
+        sync_api = import_module("playwright.sync_api")
 
-        if backup.status_code == 412:
-            print("-> Backup already exists. Atlassian said: {}".format(backup.text))
+        with sync_api.sync_playwright() as playwright:
+            browser, context = self._launch_jira_browser(playwright)
+            page = context.new_page()
+            try:
+                backup_url = self._create_jira_backup_in_browser(page)
+                self._save_playwright_storage_state(context)
+                return backup_url
+            finally:
+                browser.close()
+
+    def get_existing_jira_backup(self) -> Optional[str]:
+        """Return the latest Jira backup download URL, if Jira exposes one."""
+        try:
             backup = self.session.get(self.get_last_jira_backup)
-            if backup.status_code == 200:
-                print("-> Downloading existing backup: taskId={}".format(task_id))
-                task_id = backup.text
-            else:
-                raise Exception(backup, backup.text)
+            if backup.status_code != 200:
+                return None
 
-        elif backup.status_code == 200:
-            task_id = json.loads(backup.text)["taskId"]
-            print("-> Backup process successfully started: taskId={}".format(task_id))
-        else:
-            raise Exception(backup, backup.text)
+            task_id = backup.text.strip().strip('"')
+            if not task_id:
+                return None
 
-        jira_backup_status = "https://{jira_host}/rest/backup/1/export/getProgress?taskId={task_id}".format(
-            jira_host=self.config.host_url, task_id=task_id
-        )
-        time.sleep(self.wait)
-        while "result" not in self.backup_status.keys():
-            self.backup_status = json.loads(self.session.get(jira_backup_status).text)
-            print(
-                "Current status: {status} {progress}; {description}".format(
-                    status=self.backup_status["status"],
-                    progress=self.backup_status["progress"],
-                    description=self.backup_status["description"],
-                )
+            jira_backup_status = (
+                "https://{jira_host}/rest/backup/1/export/getProgress?taskId={task_id}"
+            ).format(jira_host=self.config.host_url, task_id=task_id)
+            status_response = self.session.get(jira_backup_status)
+            if status_response.status_code != 200:
+                return None
+
+            status = json.loads(status_response.text)
+            result_id = status.get("result")
+            if not result_id:
+                return None
+            result_id = str(result_id).lstrip("/")
+
+            return "{prefix}/{result_id}".format(
+                prefix="https://" + self.config.host_url + "/plugins/servlet",
+                result_id=result_id,
             )
-            time.sleep(self.wait)
-        return "{prefix}/{result_id}".format(
-            prefix="https://" + self.config.host_url + "/plugins/servlet",
-            result_id=self.backup_status["result"],
+        except (KeyError, TypeError, ValueError, requests.RequestException):
+            return None
+
+    def _launch_jira_browser(self, playwright: Any) -> tuple[Any, Any]:
+        storage_state_path = self._playwright_storage_state_path()
+        storage_state_exists = storage_state_path.exists()
+        headless = self.config.playwright.headless if storage_state_exists else False
+
+        if not storage_state_exists:
+            print(
+                "-> No Playwright storage state found; launching a headed browser "
+                "for one-time Atlassian login."
+            )
+
+        browser = playwright.chromium.launch(headless=headless)
+        context_options: dict[str, str] = {}
+        if storage_state_exists:
+            context_options["storage_state"] = str(storage_state_path)
+            print(f"-> Loaded Playwright storage state from {storage_state_path}")
+
+        return browser, browser.new_context(**context_options)
+
+    def _create_jira_backup_in_browser(self, page: Any) -> str:
+        backup_page = f"https://{self.config.host_url}/secure/admin/CloudExport.jspa"
+        print(f"-> Navigating to Jira Cloud Export page: {backup_page}")
+        self._goto_jira_backup_page(page, backup_page)
+        self._ensure_jira_browser_authenticated(page, backup_page)
+
+        print("-> Waiting for Jira export page to render existing backup state")
+        self._wait_for_page_timeout(page, 10_000)
+
+        pre_click_href = self._read_first_href(page, _JIRA_EXPORT_LINK_SELECTOR)
+        if pre_click_href:
+            print(f"-> Existing backup link found on page: {pre_click_href}")
+
+        try:
+            self._check_backup_rate_limit(page, wait_ms=0)
+        except RuntimeError:
+            fallback_url = self._existing_jira_backup_url(pre_click_href)
+            if fallback_url:
+                print(f"-> Using existing Jira backup: {fallback_url}")
+                return fallback_url
+            raise
+
+        self._set_jira_include_attachments(page)
+        self._click_jira_backup_button(page)
+
+        try:
+            self._check_backup_rate_limit(page)
+        except RuntimeError:
+            fallback_url = self._existing_jira_backup_url(pre_click_href)
+            if fallback_url:
+                print(f"-> Using existing Jira backup: {fallback_url}")
+                return fallback_url
+            raise
+
+        print("-> Backup process started, waiting for download link")
+        link = page.locator(_JIRA_EXPORT_LINK_SELECTOR).first
+        link.wait_for(state="visible", timeout=_JIRA_EXPORT_TIMEOUT_MS)
+        href = link.get_attribute("href")
+        if not href:
+            raise RuntimeError("Jira backup link appeared without an href attribute.")
+
+        href = self._absolute_jira_url(href)
+        self._validate_jira_backup_url(href)
+        print(f"-> Backup ready: {href}")
+        return href
+
+    def _goto_jira_backup_page(self, page: Any, backup_page: str) -> None:
+        try:
+            page.goto(
+                backup_page,
+                wait_until="load",
+                timeout=self.config.playwright.login_timeout * 1_000,
+            )
+        except Exception as exc:
+            if exc.__class__.__name__ == "TimeoutError":
+                print("-> Warning: backup page timed out waiting for load; continuing")
+                return
+            raise
+
+    def _ensure_jira_browser_authenticated(self, page: Any, backup_page: str) -> None:
+        if not self._is_auth_redirect(page.url):
+            return
+
+        if (
+            self.config.playwright.headless
+            and self._playwright_storage_state_path().exists()
+        ):
+            raise RuntimeError(
+                "Playwright storage state is expired, and Jira redirected to "
+                "Atlassian login while running headless. Run once with "
+                "playwright.headless: false, complete login/MFA in the browser, "
+                "then rerun the backup."
+            )
+
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "Atlassian login is required but no interactive terminal is "
+                "available. Run once from a terminal to create Playwright storage "
+                "state before using scheduled/headless backups."
+            )
+
+        print(
+            "-> Atlassian login is required. Complete login/MFA in the browser, "
+            "then return here."
+        )
+        while self._is_auth_redirect(page.url):
+            input("-> Press Enter after the browser login has completed: ")
+            self._goto_jira_backup_page(page, backup_page)
+
+    def _set_jira_include_attachments(self, page: Any) -> None:
+        try:
+            checkbox = page.get_by_label("Include attachments", exact=False)
+            if checkbox.is_visible(timeout=_QUICK_TIMEOUT_MS):
+                checked = checkbox.is_checked()
+                if checked != self.config.include_attachments:
+                    checkbox.click()
+        except Exception:
+            return
+
+    def _click_jira_backup_button(self, page: Any) -> None:
+        for button_name in ("Backup", "Start backup", "Export", "Submit"):
+            try:
+                button = page.get_by_role("button", name=button_name)
+                button.click(timeout=_QUICK_TIMEOUT_MS)
+                return
+            except Exception:
+                continue
+
+        page.locator('input[type="submit"], button[type="submit"]').first.click(
+            timeout=15_000
+        )
+
+    def _check_backup_rate_limit(self, page: Any, wait_ms: int = 3_000) -> None:
+        if wait_ms:
+            self._wait_for_page_timeout(page, wait_ms)
+
+        try:
+            page_text = page.locator("body").inner_text(timeout=5_000)
+        except Exception:
+            return
+
+        message = extract_backup_rate_limit_message(page_text)
+        if message:
+            print(f"-> Rate limit message from site:\n{message}")
+            raise RuntimeError(message)
+
+    def _existing_jira_backup_url(self, href: str) -> Optional[str]:
+        if href:
+            return self._absolute_jira_url(href)
+
+        backup_url = self.get_existing_jira_backup()
+        if backup_url:
+            print(f"-> Found existing Jira backup via REST API: {backup_url}")
+        return backup_url
+
+    def _read_first_href(self, page: Any, selector: str) -> str:
+        try:
+            locator = page.locator(selector).first
+            if locator.is_visible(timeout=_QUICK_TIMEOUT_MS):
+                return locator.get_attribute("href") or ""
+        except Exception:
+            return ""
+        return ""
+
+    def _absolute_jira_url(self, href: str) -> str:
+        if href.startswith("http://") or href.startswith("https://"):
+            return href
+        if not href.startswith("/"):
+            href = "/" + href
+        return f"https://{self.config.host_url}{href}"
+
+    def _validate_jira_backup_url(self, href: str) -> None:
+        if "/plugins/servlet/export/" not in href:
+            raise RuntimeError(
+                "Unexpected Jira backup URL detected "
+                f"(possible page-layout mismatch): {href}"
+            )
+
+    def _save_playwright_storage_state(self, context: Any) -> None:
+        storage_state_path = self._playwright_storage_state_path()
+        try:
+            storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+            context.storage_state(path=str(storage_state_path))
+            print(f"-> Playwright storage state saved to {storage_state_path}")
+        except Exception as exc:
+            print(f"-> Warning: could not save Playwright storage state ({exc})")
+
+    def _playwright_storage_state_path(self) -> Path:
+        path = Path(self.config.playwright.storage_state).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
+
+    def _wait_for_page_timeout(self, page: Any, wait_ms: int) -> None:
+        try:
+            page.wait_for_timeout(wait_ms)
+        except Exception:
+            time.sleep(wait_ms / 1_000)
+
+    def _is_auth_redirect(self, url: str) -> bool:
+        url_lower = url.lower()
+        return any(
+            indicator in url_lower
+            for indicator in (
+                "id.atlassian.com",
+                "atlassian.com/login",
+                "/login",
+            )
         )
 
     def download_file(self, url: str, local_filename: str, max_retries: int = 5) -> str:
@@ -578,7 +822,6 @@ def main() -> None:
             print(f"-> Error setting up scheduled task: {e}")
             exit(1)
 
-    config = read_config(config_path=config_path)
     try:
         config = read_config(config_path=config_path)
     except Exception as e:
@@ -596,17 +839,26 @@ def main() -> None:
         print(f"-> Error: {e}", file=sys.stderr)
         exit(1)
 
+    backup_type = "confluence" if args.confluence else "jira"
     print(
-        "-> Starting backup; include attachments: {}".format(config.include_attachments)
+        "-> Starting {} backup; include attachments: {}".format(
+            backup_type, config.include_attachments
+        )
     )
 
     atlass = Atlassian(config)
 
-    backup_type = "confluence" if args.confluence else "jira"
-    if args.confluence:
-        backup_url = atlass.create_confluence_backup()
-    else:
-        backup_url = atlass.create_jira_backup()
+    try:
+        if args.confluence:
+            backup_url = atlass.create_confluence_backup()
+        else:
+            backup_url = atlass.create_jira_backup()
+    except OptionalExtraMissingError as e:
+        print(f"-> Error: {e}", file=sys.stderr)
+        exit(1)
+    except (RuntimeError, TimeoutError) as e:
+        print(f"-> Backup failed: {e}", file=sys.stderr)
+        exit(1)
 
     print("-> Backup URL: {}".format(backup_url))
     file_name = atlass.generate_filename(backup_url, backup_type)

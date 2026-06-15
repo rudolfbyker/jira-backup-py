@@ -49,6 +49,12 @@ pip install jira_backup
    pip install .
    ```
 
+Install the Playwright browser used to trigger Jira backups:
+
+```bash
+playwright install chromium
+```
+
 ### Post-installation steps
 
 1. Go to [Atlassian API Tokens](https://id.atlassian.com/manage/api-tokens) and create a token.
@@ -81,6 +87,11 @@ user_email: "your.email@company.com"
 api_token: "your-api-token"
 include_attachments: false
 download_locally: true
+
+playwright:
+  headless: true
+  login_timeout: 300
+  storage_state: "playwright_storage_state.json"
 
 # AWS S3 Configuration (optional)
 upload_to_s3:
@@ -118,6 +129,19 @@ custom_filename:
   jira: "jira.{timestamp}"
   confluence: "confluence.{timestamp}"
 ```
+
+#### Jira Playwright Login
+
+Jira backup creation uses Playwright because Atlassian no longer supports triggering Jira backups through the REST API. The rest of the backup flow still uses the configured API token and storage settings.
+
+```yaml
+playwright:
+  headless: true
+  login_timeout: 300
+  storage_state: "playwright_storage_state.json"
+```
+
+The first Jira backup run opens a headed browser so you can complete Atlassian login and MFA. After that, the saved storage state is reused for headless runs. If Atlassian says a recent backup already exists, the tool uses the existing Jira backup link when available.
 
 #### Configuration wizard
 

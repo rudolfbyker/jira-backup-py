@@ -31,6 +31,7 @@ backups/*
 *.pyc
 __pycache__/
 playwright_cookies.json
+playwright_storage_state.json
 .pytest_cache/
 .mypy_cache/
 .coverage

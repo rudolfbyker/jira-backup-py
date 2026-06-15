@@ -5,6 +5,15 @@ api_token: "replace-with-atlassian-api-token"
 include_attachments: false
 download_locally: true
 
+# Jira backup creation uses Playwright because Atlassian no longer supports
+# triggering Jira backups through the REST API. The first run opens a headed
+# browser so you can complete Atlassian login/MFA; later runs reuse the saved
+# storage state.
+playwright:
+  headless: true
+  login_timeout: 300
+  storage_state: "playwright_storage_state.json"
+
 # Optional. To skip S3 upload, leave `s3_bucket` empty or remove the `upload_to_s3` section.
 upload_to_s3:
   aws_endpoint_url: ""

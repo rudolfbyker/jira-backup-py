@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 
 import yaml
 from pydantic import (
@@ -104,12 +105,34 @@ class ConfigCustomFilename(ConfigModel):
     jira: str = ""
 
 
+class ConfigPlaywright(ConfigModel):
+    headless: StrictBool = True
+    login_timeout: int = 300
+    storage_state: str = "playwright_storage_state.json"
+
+    @field_validator("login_timeout")
+    @classmethod
+    def login_timeout_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+
+    @field_validator("storage_state")
+    @classmethod
+    def storage_state_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+
 class Config(ConfigModel):
     host_url: str
     user_email: str
     api_token: str
     include_attachments: StrictBool
     download_locally: StrictBool
+    playwright: ConfigPlaywright = Field(default_factory=ConfigPlaywright)
     upload_to_s3: ConfigUploadToS3 | None = None
     upload_to_gcp: ConfigUploadToGCP | None = None
     upload_to_azure: ConfigUploadToAzure | None = None
