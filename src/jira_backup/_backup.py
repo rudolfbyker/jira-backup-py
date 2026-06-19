@@ -515,7 +515,7 @@ def main() -> None:
                 time_hour=hour,
                 time_minute=minute,
                 service_type=args.schedule_service,
-                config_path=config_path,
+                config_path=config_path.resolve(),
             )
             print("-> Scheduled task setup completed")
             exit(0)
