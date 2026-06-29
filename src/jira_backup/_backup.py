@@ -23,11 +23,14 @@ class OptionalExtraMissingError(RuntimeError):
 def import_optional_extra(module_name: str, extra_name: str, purpose: str) -> Any:
     try:
         return import_module(module_name)
-    except ImportError as e:
-        raise OptionalExtraMissingError(
-            f"{purpose} requires the optional '{extra_name}' extra. "
-            f"Install it with: pip install 'jira_backup[{extra_name}]'"
-        ) from e
+    except ModuleNotFoundError as e:
+        missing_root = module_name.split(".")[0]
+        if getattr(e, "name", None) in (missing_root, module_name):
+            raise OptionalExtraMissingError(
+                f"{purpose} requires the optional '{extra_name}' extra. "
+                f"Install it with: pip install \"jira_backup[{extra_name}]\""
+            ) from e
+        raise
 
 
 def ensure_upload_extras(config: Config) -> None:
